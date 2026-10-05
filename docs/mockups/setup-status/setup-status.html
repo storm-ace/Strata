@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Strata setup - mock</title>
+<style>
+@font-face{font-family:"Outfit";src:url("fonts/outfit-latin-wght.woff2") format("woff2-variations");font-weight:100 900}
+:root{
+  --st-font:"Outfit",system-ui,"Segoe UI",sans-serif;
+  --st-mono:ui-monospace,"Cascadia Code",Consolas,monospace;
+  --bg:#f9fafb;--surface:#fff;--surface-2:#f7f7f7;--line:#dee5ee;--line-soft:#eee;
+  --ink:#221e1f;--ink-muted:#6f6f6f;
+  --accent:#10b981;--accent-tint:#ecfdf5;--accent-text:#0c8a60;
+  --info:#0f97ff;--info-tint:#e8f4ff;--info-text:#0668c2;
+  --warn:#e39b0b;--warn-tint:#fff6e0;--warn-text:#8a5a00;
+  --danger:#e0283f;--danger-tint:#fdecee;--danger-text:#b01a2e;
+  --code-bg:#1b1f23;--code-ink:#e6e9ec;
+  --sh:0 10px 40px rgba(15,23,42,.08),0 1px 3px rgba(15,23,42,.06);
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--st-font);font-size:15px;line-height:1.5}
+.wrap{max-width:1120px;margin:0 auto;padding:28px 32px}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:20px}
+.logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,#10b981,#0f97ff)}
+.sub{color:var(--ink-muted);font-weight:400;font-size:15px}
+.chips{display:flex;gap:8px;flex-wrap:wrap}
+.chip{background:var(--surface);border:1px solid var(--line);border-radius:9999px;padding:4px 12px;font-size:13px;color:var(--ink-muted)}
+.chip b{color:var(--ink);font-weight:500}
+.grid{display:grid;grid-template-columns:300px minmax(0,1fr);gap:20px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:20px;box-shadow:var(--sh);padding:22px}
+.steps{list-style:none;margin:0;padding:0}
+.steps li{display:flex;gap:12px;padding:10px 0;border-bottom:1px solid var(--line-soft);align-items:flex-start}
+.steps li:last-child{border-bottom:0}
+.dot{flex:0 0 22px;height:22px;border-radius:50%;display:grid;place-items:center;font-size:12px;font-weight:700;margin-top:1px}
+.done .dot{background:var(--accent-tint);color:var(--accent-text)}
+.now .dot{background:var(--info);color:#fff;box-shadow:0 0 0 4px var(--info-tint)}
+.todo .dot{background:var(--surface-2);color:#aaa;border:1px solid var(--line)}
+.err .dot{background:var(--danger);color:#fff;box-shadow:0 0 0 4px var(--danger-tint)}
+.steps .t{font-weight:500}
+.steps .d{font-size:13px;color:var(--ink-muted)}
+.todo .t{color:var(--ink-muted);font-weight:400}
+h2{margin:0 0 4px;font-size:22px}
+.lead{color:var(--ink-muted);margin:0 0 18px}
+.big{display:flex;align-items:baseline;gap:14px;margin:8px 0 10px}
+.pct{font-size:40px;font-weight:700;line-height:1}
+.eta{font-size:15px;color:var(--ink-muted)}
+.eta b{color:var(--ink)}
+.bar{height:12px;background:var(--surface-2);border:1px solid var(--line);border-radius:9999px;overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--info);border-radius:9999px}
+.bar.ok>i{background:var(--accent)}
+.bar.sm{height:8px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}
+.stat{background:var(--surface-2);border-radius:14px;padding:12px 14px}
+.stat .k{font-size:12px;color:var(--ink-muted)}
+.stat .v{font-size:20px;font-weight:700}
+.files{margin:6px 0 18px}
+.file{display:grid;grid-template-columns:1fr 150px 70px;gap:12px;align-items:center;font-size:13px;padding:6px 0}
+.file .n{font-family:var(--st-mono);font-size:12px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.file .s{text-align:right;color:var(--ink-muted)}
+.note{border-radius:14px;padding:12px 14px;font-size:14px;margin:0 0 16px}
+.note.info{background:var(--info-tint);color:var(--info-text)}
+.note.warn{background:var(--warn-tint);color:var(--warn-text)}
+.note.danger{background:var(--danger-tint);color:var(--danger-text)}
+.log{background:var(--code-bg);color:var(--code-ink);border-radius:14px;padding:12px 14px;font-family:var(--st-mono);font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;overflow:hidden}
+.log .m{color:#8b949e}
+.log .g{color:#3fb950}
+.log .y{color:#d29922}
+.log .r{color:#f85149}
+.row{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.btn{display:inline-block;border-radius:9999px;padding:8px 16px;font-size:14px;font-weight:500;border:1px solid var(--line);background:var(--surface);color:var(--ink)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.label{font-size:12px;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.06em;margin:0 0 8px}
+.state{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand"><div class="logo"></div>Strata <span class="sub">· setting up on this PC</span></div>
+    <div class="chips">
+      <span class="chip">GPU <b>Radeon 8060S · gfx1151</b></span>
+      <span class="chip">RAM <b>48 GB</b></span>
+      <span class="chip">Disk <b>186 GB free</b></span>
+      <span class="chip">Model <b>Qwen3.8-Flash-Next IQ2_XS</b></span>
+    </div>
+  </header>
+
+  <!-- ===================== state: download ===================== -->
+  <div class="state" id="download">
+  <div class="grid">
+    <div class="card">
+      <p class="label">Steps</p>
+      <ul class="steps">
+        <li class="done"><span class="dot">✓</span><div><div class="t">Check this PC</div><div class="d">AMD gfx1151, 48 GB RAM, AVX-512</div></div></li>
+        <li class="done"><span class="dot">✓</span><div><div class="t">Strata engine</div><div class="d">ready-made AMD engine 0.1.39</div></div></li>
+        <li class="now"><span class="dot">3</span><div><div class="t">Download the model</div><div class="d">68.0 GB · about 12 min left</div></div></li>
+        <li class="todo"><span class="dot">4</span><div><div class="t">Prepare the model</div><div class="d">~5 min</div></div></li>
+        <li class="todo"><span class="dot">5</span><div><div class="t">Load the model</div><div class="d">1-3 min</div></div></li>
+        <li class="todo"><span class="dot">6</span><div><div class="t">Ready to chat</div></div></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>Downloading the model</h2>
+      <p class="lead">From Hugging Face. You can close this page; setup keeps going. If it stops, running setup again continues where it left off.</p>
+      <div class="big"><span class="pct">41%</span><span class="eta"><b>27.9 of 68.0 GB</b> · about <b>12 min</b> left</span></div>
+      <div class="bar"><i style="width:41%"></i></div>
+      <div class="stats">
+        <div class="stat"><div class="k">Speed</div><div class="v">58 MB/s</div></div>
+        <div class="stat"><div class="k">Connections</div><div class="v">8</div></div>
+        <div class="stat"><div class="k">Elapsed</div><div class="v">8 min</div></div>
+        <div class="stat"><div class="k">Verified</div><div class="v">0 of 2</div></div>
+      </div>
+      <div class="files">
+        <div class="file"><span class="n">Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf</span><div class="bar sm"><i style="width:71%"></i></div><span class="s">71%</span></div>
+        <div class="file"><span class="n">Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf</span><div class="bar sm"><i style="width:0%"></i></div><span class="s">waiting</span></div>
+      </div>
+      <div class="log"><span class="g">[ok]</span> GPU: AMD Radeon(TM) 8060S Graphics, 16.0 GB shared GPU memory, gfx1151
+<span class="g">[ok]</span> ready-made AMD engine 0.1.39 for gfx1100, ..., gfx1151, gfx1201
+<span class="m">=== Step 5: downloading Qwen3.8-Flash-Next IQ2_XS ===</span>
+  ...-IQ2_XS-00001-of-00002.gguf:  27.88 / 39.23 GB (71%)</div>
+    </div>
+  </div>
+  </div>
+
+  <!-- ===================== state: prepare ===================== -->
+  <div class="state" id="prepare">
+  <div class="grid">
+    <div class="card">
+      <p class="label">Steps</p>
+      <ul class="steps">
+        <li class="done"><span class="dot">✓</span><div><div class="t">Check this PC</div><div class="d">AMD gfx1151, 48 GB RAM, AVX-512</div></div></li>
+        <li class="done"><span class="dot">✓</span><div><div class="t">Strata engine</div><div class="d">ready-made AMD engine 0.1.39</div></div></li>
+        <li class="done"><span class="dot">✓</span><div><div class="t">Download the model</div><div class="d">68.0 GB in 19 min, both files verified</div></div></li>
+        <li class="now"><span class="dot">4</span><div><div class="t">Prepare the model</div><div class="d">part 2 of 3 · about 2 min left</div></div></li>
+        <li class="todo"><span class="dot">5</span><div><div class="t">Load the model</div><div class="d">1-3 min</div></div></li>
+        <li class="todo"><span class="dot">6</span><div><div class="t">Ready to chat</div></div></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>Preparing the model for this PC</h2>
+      <p class="lead">Once only. Next time Strata starts right away.</p>
+      <div class="files" style="margin-top:4px">
+        <div class="file"><span class="n">1 · expert layout (native pack)</span><div class="bar sm ok"><i style="width:100%"></i></div><span class="s">done</span></div>
+        <div class="file"><span class="n">2 · draft layer (MTP): 512 experts to Q2_0</span><div class="bar sm"><i style="width:61%"></i></div><span class="s">61%</span></div>
+        <div class="file"><span class="n">3 · start script and settings</span><div class="bar sm"><i style="width:0%"></i></div><span class="s">waiting</span></div>
+      </div>
+      <div class="note info"><b>What is the draft layer?</b> A small helper that guesses the next words; the big model checks them all at once, so answers appear 1.6-1.8x sooner with the same result. Setup builds it from 31 tensors of the original model (fetched with range requests, not the 360 GB checkpoint).</div>
+      <div class="big"><span class="pct">61%</span><span class="eta">expert <b>312 of 512</b> · about <b>2 min</b> left</span></div>
+      <div class="bar"><i style="width:61%"></i></div>
+      <div class="stats">
+        <div class="stat"><div class="k">Step</div><div class="v">2 of 3</div></div>
+        <div class="stat"><div class="k">CPU</div><div class="v">1 core</div></div>
+        <div class="stat"><div class="k">Output</div><div class="v">0.71 GB</div></div>
+        <div class="stat"><div class="k">Elapsed</div><div class="v">3 min</div></div>
+      </div>
+    </div>
+  </div>
+  </div>
+
+  <!-- ===================== state: load ===================== -->
+  <div class="state" id="load">
+  <div class="grid">
+    <div class="card">
+      <p class="label">Steps</p>
+      <ul class="steps">
+        <li class="done"><span class="dot">✓</span><div><div class="t">Check this PC</div></div></li>
+        <li class="done"><span class="dot">✓</span><div><div class="t">Strata engine</div></div></li>
+        <li class="done"><span class="dot">✓</span><div><div class="t">Download the model</div></div></li>
+        <li class="done"><span class="dot">✓</span><div><div class="t">Prepare the model</div></div></li>
+        <li class="now"><span class="dot">5</span><div><div class="t">Load the model</div><div class="d">phase 2 of 4 · about 50 s left</div></div></li>
+        <li class="todo"><span class="dot">6</span><div><div class="t">Ready to chat</div></div></li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="row"><h2>Loading the model</h2><span class="chip">API: <b>503 "starting"</b></span></div>
+      <p class="lead">This page becomes the chat as soon as the model is ready.</p>
+      <div class="note warn"><b>Your PC can be slow for 1-3 minutes.</b> Strata loads 36 GB into RAM and reserves part of it for the GPU. That is normal: keep this window open. Closing other programs (browsers use a lot) makes it faster.</div>
+      <div class="files">
+        <div class="file"><span class="n">1 · the model's weights</span><div class="bar sm ok"><i style="width:100%"></i></div><span class="s">done</span></div>
+        <div class="file"><span class="n">2 · experts into RAM (31.6 GiB)</span><div class="bar sm"><i style="width:58%"></i></div><span class="s">18.3 GiB</span></div>
+        <div class="file"><span class="n">3 · most-used experts to the GPU</span><div class="bar sm"><i style="width:0%"></i></div><span class="s">waiting</span></div>
+        <div class="file"><span class="n">4 · draft layer and warm-up</span><div class="bar sm"><i style="width:0%"></i></div><span class="s">waiting</span></div>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="k">RAM used</div><div class="v">29 / 48 GB</div></div>
+        <div class="stat"><div class="k">GPU memory</div><div class="v">6.1 GB</div></div>
+        <div class="stat"><div class="k">Read speed</div><div class="v">3.6 GB/s</div></div>
+        <div class="stat"><div class="k">Elapsed</div><div class="v">41 s</div></div>
+      </div>
+      <div class="log"><span class="m">[strata]</span> starting the engine: reading the model's weights ...
+<span class="m">[strata]</span> loading the experts the GPU does not hold into RAM (of 31.6 GiB) and locking part of them for the GPU.
+<span class="m">strata generate:</span> integrated AMD GPU: 13.40 GiB of its carve-out free</div>
+    </div>
+  </div>
+  </div>
+
+  <!-- ===================== state: error ===================== -->
+  <div class="state" id="error">
+  <div class="grid">
+    <div class="card">
+      <p class="label">Steps</p>
+      <ul class="steps">
+        <li class="done"><span class="dot">✓</span><div><div class="t">Check this PC</div></div></li>
+        <li class="done"><span class="dot">✓</span><div><div class="t">Strata engine</div></div></li>
+        <li class="err"><span class="dot">!</span><div><div class="t">Download the model</div><div class="d">paused at 52% · retrying</div></div></li>
+        <li class="todo"><span class="dot">4</span><div><div class="t">Prepare the model</div></div></li>
+        <li class="todo"><span class="dot">5</span><div><div class="t">Load the model</div></div></li>
+        <li class="todo"><span class="dot">6</span><div><div class="t">Ready to chat</div></div></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>The download was interrupted</h2>
+      <p class="lead">Nothing is lost: 35.4 of 68.0 GB is on disk and setup continues from there.</p>
+      <div class="note danger"><b>Connection reset by Hugging Face</b> (attempt 2 of 30). Retrying in <b>7 s</b>. If this keeps happening: check the internet connection, or set <code>HF_ENDPOINT</code> to a mirror.</div>
+      <div class="big"><span class="pct">52%</span><span class="eta"><b>35.4 of 68.0 GB</b> · waiting to retry</span></div>
+      <div class="bar"><i style="width:52%;background:var(--warn)"></i></div>
+      <div style="display:flex;gap:10px;margin:18px 0">
+        <span class="btn primary">Retry now</span><span class="btn">Open the log file</span><span class="btn">Copy details for an issue</span>
+      </div>
+      <div class="log"><span class="m">  ...-IQ2_XS-00002-of-00002.gguf:  11.52 / 28.80 GB (40%)</span>
+<span class="y">[!!]</span> download interrupted ([WinError 10054] An existing connection was forcibly closed by the remote host); retrying in 10 s ...</div>
+    </div>
+  </div>
+  </div>
+</div>
+<script>
+  const s = (location.hash || "#download").slice(1);
+  (document.getElementById(s) || document.getElementById("download")).style.display = "block";
+</script>
+</body>
+</html>
