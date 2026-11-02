@@ -253,9 +253,15 @@ struct RowSel {
 /// Rotary position of a cell: the cell itself (text) plus *rdelta (what the pictures before a text run did not use
 /// of their cells, see mrope), or, with `mtab` (a request's prompt cells, device int32 [cell][3] = t, h, w), the
 /// interleaved M-RoPE position (llama.cpp's IMROPE with sections 11 / 11 / 10: pair p takes stream p % 3).
-/// grid (H + HKV, T), block 256 (HD <= 256).
+/// grid (H + HKV, T), block 256 (HD <= 256).  CT: the K / V cache's element type (float, or __half with
+/// STRATA_Q36_KV16=1); the attention kernels below read it through kv_ld.
+__device__ __forceinline__ float kv_ld(const float* p) { return *p; }
+__device__ __forceinline__ float kv_ld(const __half* p) { return __half2float(*p); }
+__device__ __forceinline__ void kv_st(float* p, float v) { *p = v; }
+__device__ __forceinline__ void kv_st(__half* p, float v) { *p = __float2half(v); }
+template <typename CT>
 __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, const float* qw, const float* kw,
-                            float* q, float* gate, float* kc, float* vc, int H, int HKV, int HD, int n_rot,
+                            float* q, float* gate, CT* kc, CT* vc, int H, int HKV, int HD, int n_rot,
                             const int32_t* pos0, int ctx, float base, float eps, const int32_t* rdelta,
                             const int32_t* mtab, RowSel rs) {
     __shared__ float sh[kThreads];
@@ -264,8 +270,8 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
     const int pos = rs.cell ? rs.cell[t] : *pos0 + t;
     const int dl = rs.delta ? rs.delta[t] : (rdelta ? *rdelta : 0);
     if (rs.kc) {
-        kc = rs.kc[rs.slot[t]];
-        vc = rs.vc[rs.slot[t]];
+        kc = reinterpret_cast<CT*>(rs.kc[rs.slot[t]]);
+        vc = reinterpret_cast<CT*>(rs.vc[rs.slot[t]]);
     }
     const bool isq = head < H;
     const float* src = isq ? qg + ((size_t) t * H + head) * 2 * HD : kx + ((size_t) t * HKV + head - H) * HD;
@@ -291,15 +297,16 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
         gate[((size_t) t * H + head) * HD + i] = qg[((size_t) t * H + head) * 2 * HD + HD + i];
     } else {
         const int kh = head - H;
-        kc[((size_t) kh * ctx + pos) * HD + i] = v;
-        vc[((size_t) kh * ctx + pos) * HD + i] = vx[((size_t) t * HKV + kh) * HD + i];
+        kv_st(kc + ((size_t) kh * ctx + pos) * HD + i, v);
+        kv_st(vc + ((size_t) kh * ctx + pos) * HD + i, vx[((size_t) t * HKV + kh) * HD + i]);
     }
 }
 
 /// Split-K attention, one block per (chunk of 256 cells, query row): query row qi = t * H + h (t from t0) sees the
 /// cells [0, *pos0 + t].  Writes the chunk's partial accumulator, max and sum; chunks past the query's cells write
 /// nothing (the merge stops before them).  grid (n_chunk, n_rows), block 256, HD == 256.
-__global__ void k_attn_part(const float* q, const float* kc, const float* vc, const int32_t* pos0, int t0, int H,
+template <typename CT>
+__global__ void k_attn_part(const float* q, const CT* kc, const CT* vc, const int32_t* pos0, int t0, int H,
                             int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl, RowSel rs) {
     constexpr int HD = 256;
     __shared__ float qs[HD], sc[kChunkCells], sh[kThreads];
@@ -307,8 +314,8 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, co
     const int t = t0 + row / H, h = row % H, kvh = h / (H / HKV);
     const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
     if (rs.kc) {
-        kc = rs.kc[rs.slot[t]];
-        vc = rs.vc[rs.slot[t]];
+        kc = reinterpret_cast<const CT*>(rs.kc[rs.slot[t]]);
+        vc = reinterpret_cast<const CT*>(rs.vc[rs.slot[t]]);
     }
     const int p0 = c * kChunkCells;
     if (p0 >= npos) return;
@@ -318,9 +325,9 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, co
     const int p = p0 + j;
     float s = -INFINITY;
     if (p < npos) {
-        const float* kp = kc + ((size_t) kvh * ctx + p) * HD;
+        const CT* kp = kc + ((size_t) kvh * ctx + p) * HD;
         float a = 0.f;
-        for (int i = 0; i < HD; ++i) a += qs[i] * kp[i];
+        for (int i = 0; i < HD; ++i) a += qs[i] * kv_ld(kp + i);
         s = a * scale;
     }
     const float m = block_max(s, sh);
@@ -329,8 +336,8 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, co
     const float l = block_sum(e, sh);
     const int n = min(kChunkCells, npos - p0);
     float acc = 0.f;
-    const float* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
-    for (int k = 0; k < n; ++k) acc += sc[k] * vp[(size_t) k * HD];
+    const CT* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
+    for (int k = 0; k < n; ++k) acc += sc[k] * kv_ld(vp + (size_t) k * HD);
     const size_t o = (size_t) row * n_chunk + c;
     pacc[o * HD + j] = acc;
     if (j == 0) {
@@ -362,8 +369,8 @@ __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl
 /// Same partials and layout, so k_attn_merge follows unchanged.  grid (n_tokens * HKV, n_chunk), block 256, HD == 256:
 /// the rows of a window (verify, batch) on the same chunk are neighbours in the launch order, so they meet its cells in
 /// the cache.
-template <int G>
-__global__ void __launch_bounds__(256) k_attn_part_gqa(const float* q, const float* kc, const float* vc, const int32_t* pos0,
+template <int G, typename CT>
+__global__ void __launch_bounds__(256) k_attn_part_gqa(const float* q, const CT* kc, const CT* vc, const int32_t* pos0,
                                                        int t0, int H, int HKV, int ctx, float scale, int n_chunk,
                                                        float* pacc, float* pm, float* pl, RowSel rs) {
     constexpr int HD = 256;
@@ -373,8 +380,8 @@ __global__ void __launch_bounds__(256) k_attn_part_gqa(const float* q, const flo
     const int t = t0 + tl;
     const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
     if (rs.kc) {
-        kc = rs.kc[rs.slot[t]];
-        vc = rs.vc[rs.slot[t]];
+        kc = reinterpret_cast<const CT*>(rs.kc[rs.slot[t]]);
+        vc = reinterpret_cast<const CT*>(rs.vc[rs.slot[t]]);
     }
     const int p0 = c * kChunkCells;
     if (p0 >= npos) return;
@@ -387,12 +394,12 @@ __global__ void __launch_bounds__(256) k_attn_part_gqa(const float* q, const flo
 #pragma unroll
     for (int g = 0; g < G; ++g) a[g] = 0.f;
     // each thread still sums its own cell over i = 0..HD-1 in order (k_attn_part's bits); only the loads are shared
-    const float* kbase = kc + ((size_t) kvh * ctx + p0) * HD;
+    const CT* kbase = kc + ((size_t) kvh * ctx + p0) * HD;
     for (int i0 = 0; i0 < HD; i0 += TI) {
 #pragma unroll
         for (int r = 0; r < TI; ++r) {
             const int idx = r * kChunkCells + j, cell = idx / TI, d = idx % TI;
-            kt[cell][d] = p0 + cell < npos ? kbase[(size_t) cell * HD + i0 + d] : 0.f;
+            kt[cell][d] = p0 + cell < npos ? kv_ld(kbase + (size_t) cell * HD + i0 + d) : 0.f;
         }
         __syncthreads();
         if (p < npos) {
@@ -418,9 +425,9 @@ __global__ void __launch_bounds__(256) k_attn_part_gqa(const float* q, const flo
     float acc[G];
 #pragma unroll
     for (int g = 0; g < G; ++g) acc[g] = 0.f;
-    const float* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
+    const CT* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
     for (int k = 0; k < n; ++k) {
-        const float v = vp[(size_t) k * HD];
+        const float v = kv_ld(vp + (size_t) k * HD);
 #pragma unroll
         for (int g = 0; g < G; ++g) acc[g] += sc[g][k] * v;
     }
@@ -503,14 +510,15 @@ __global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss,
 }
 /// The prompt attention's FP16 operands: cells [0, P) of each KV head's K / V (cache rows ctx apart) into compact
 /// [kvh][P][HD] halves.  grid1(HKV * P * HD).
-__global__ void k_kv_f16(const float* kc, const float* vc, __half* k16, __half* v16, int ctx, int P, int HD, int HKV) {
+template <typename CT>
+__global__ void k_kv_f16(const CT* kc, const CT* vc, __half* k16, __half* v16, int ctx, int P, int HD, int HKV) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (int64_t) HKV * P * HD) return;
     const int64_t per = (int64_t) P * HD;
     const int64_t kvh = i / per, rest = i % per;
     const size_t src = (size_t) kvh * ctx * HD + rest;
-    k16[i] = __float2half(kc[src]);
-    v16[i] = __float2half(vc[src]);
+    k16[i] = __float2half(kv_ld(kc + src));
+    v16[i] = __float2half(kv_ld(vc + src));
 }
 /// The prompt's causal softmax: row (h, t) of S (ld floats, P cells) -> softmax(S * scale) over the cells
 /// [0, pos0 + t], 0 past them, as FP16 probabilities (S16, the same row offsets, ld halves).  grid (T, H), block 256.
@@ -1453,6 +1461,11 @@ struct Engine {
     float* sk_part = nullptr;          // the split-K partials of the F32 projections: [kSplitK][tmax][<= 257]
     __half* att_p16 = nullptr;         // the probabilities in FP16 (kAttScoreFloats halves)
     __half *k16 = nullptr, *v16 = nullptr, *q16 = nullptr;   // the prompt attention's FP16 operands
+    // STRATA_Q36_KV16=1: the K / V caches in FP16 instead of FP32 (half the bytes the decode attention reads per token
+    // and per cell held; the cache pointers stay float* and the kernels take the element type as a template)
+    bool kv16 = std::getenv("STRATA_Q36_KV16") != nullptr;
+    size_t kv_elt() const { return kv16 ? 2 : 4; }
+    size_t kv_floats(size_t n) const { return kv16 ? (n + 1) / 2 : n; }   // a cache of n elements, in dalloc's floats
     float* att2 = nullptr;   // the grouped prompt attention's output [kvh][t][g][HD]
     // STRATA_Q36_ATT_OLD=1: the prompt attention as G narrow products per KV head (the grouped one is the default)
     bool att_grouped = std::getenv("STRATA_Q36_ATT_OLD") == nullptr;
@@ -1573,8 +1586,8 @@ struct Engine {
             if (L.attn) {
                 ss.conv.push_back(nullptr);
                 ss.S.push_back(nullptr);
-                ss.kc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
-                ss.vc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+                ss.kc.push_back(dalloc(kv_floats((size_t) g.n_head_kv * ctx * g.head_dim)));
+                ss.vc.push_back(dalloc(kv_floats((size_t) g.n_head_kv * ctx * g.head_dim)));
             } else {
                 ss.conv.push_back(dalloc(C * (g.ssm_d_conv - 1)));
                 ss.S.push_back(dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
@@ -1585,8 +1598,8 @@ struct Engine {
         if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
             ss.conv.push_back(nullptr);
             ss.S.push_back(nullptr);
-            ss.kc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
-            ss.vc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+            ss.kc.push_back(dalloc(kv_floats((size_t) g.n_head_kv * ctx * g.head_dim)));
+            ss.vc.push_back(dalloc(kv_floats((size_t) g.n_head_kv * ctx * g.head_dim)));
         }
         ss.hlast = dalloc((size_t) g.n_embd);
     }
@@ -1892,16 +1905,33 @@ struct Engine {
     size_t vatt_n = 0;
     /// The decode attention's partials with the GQA kernel (one block per KV head and chunk) when the group size has an
     /// instance; false leaves them to k_attn_part.
-    bool attn_part_gqa(int G, int nc, int nt, int HKV, const float* q_, const float* kc_, const float* vc_, const int32_t* pos0,
-                       int t0, int H, int ctx_, float scale, const RowSel& rs) {
+    template <typename CT>
+    bool attn_part_gqa_t(int G, int nc, int nt, int HKV, const float* q_, const CT* kc_, const CT* vc_, const int32_t* pos0,
+                         int t0, int H, int ctx_, float scale, const RowSel& rs) {
         const dim3 grid(nt * HKV, nc);
         switch (G) {
-            case 2: k_attn_part_gqa<2><<<grid, kChunkCells, 0, st>>>(q_, kc_, vc_, pos0, t0, H, HKV, ctx_, scale, n_chunk, pacc, pm, pl, rs); return true;
-            case 4: k_attn_part_gqa<4><<<grid, kChunkCells, 0, st>>>(q_, kc_, vc_, pos0, t0, H, HKV, ctx_, scale, n_chunk, pacc, pm, pl, rs); return true;
-            case 8: k_attn_part_gqa<8><<<grid, kChunkCells, 0, st>>>(q_, kc_, vc_, pos0, t0, H, HKV, ctx_, scale, n_chunk, pacc, pm, pl, rs); return true;
-            case 16: k_attn_part_gqa<16><<<grid, kChunkCells, 0, st>>>(q_, kc_, vc_, pos0, t0, H, HKV, ctx_, scale, n_chunk, pacc, pm, pl, rs); return true;
+            case 2: k_attn_part_gqa<2, CT><<<grid, kChunkCells, 0, st>>>(q_, kc_, vc_, pos0, t0, H, HKV, ctx_, scale, n_chunk, pacc, pm, pl, rs); return true;
+            case 4: k_attn_part_gqa<4, CT><<<grid, kChunkCells, 0, st>>>(q_, kc_, vc_, pos0, t0, H, HKV, ctx_, scale, n_chunk, pacc, pm, pl, rs); return true;
+            case 8: k_attn_part_gqa<8, CT><<<grid, kChunkCells, 0, st>>>(q_, kc_, vc_, pos0, t0, H, HKV, ctx_, scale, n_chunk, pacc, pm, pl, rs); return true;
+            case 16: k_attn_part_gqa<16, CT><<<grid, kChunkCells, 0, st>>>(q_, kc_, vc_, pos0, t0, H, HKV, ctx_, scale, n_chunk, pacc, pm, pl, rs); return true;
             default: return false;
         }
+    }
+    bool attn_part_gqa(int G, int nc, int nt, int HKV, const float* q_, const float* kc_, const float* vc_, const int32_t* pos0,
+                       int t0, int H, int ctx_, float scale, const RowSel& rs) {
+        if (kv16)
+            return attn_part_gqa_t<__half>(G, nc, nt, HKV, q_, reinterpret_cast<const __half*>(kc_), reinterpret_cast<const __half*>(vc_),
+                                           pos0, t0, H, ctx_, scale, rs);
+        return attn_part_gqa_t<float>(G, nc, nt, HKV, q_, kc_, vc_, pos0, t0, H, ctx_, scale, rs);
+    }
+    /// k_attn_part (the per-head decode attention) on the cache's element type
+    void attn_part_old(const dim3& grid, const float* q_, const float* kc_, const float* vc_, const int32_t* pos0, int t0, int H,
+                       int HKV, int ctx_, float scale, const RowSel& rs) {
+        if (kv16)
+            k_attn_part<__half><<<grid, kChunkCells, 0, st>>>(q_, reinterpret_cast<const __half*>(kc_), reinterpret_cast<const __half*>(vc_),
+                                                              pos0, t0, H, HKV, ctx_, scale, n_chunk, pacc, pm, pl, rs);
+        else
+            k_attn_part<float><<<grid, kChunkCells, 0, st>>>(q_, kc_, vc_, pos0, t0, H, HKV, ctx_, scale, n_chunk, pacc, pm, pl, rs);
     }
     long long v_calls = 0, v_bad = 0;
     std::map<std::string, long long> v_by;   // mismatches per check
@@ -2265,9 +2295,16 @@ struct Engine {
                 rs.kc = d_kc_tab + li * n_sess;
                 rs.vc = d_vc_tab + li * n_sess;
             }
-            k_attn_prep<<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, rows_mode ? nullptr : kc[li],
-                                                              rows_mode ? nullptr : vc[li], H, HKV, HD, m->n_rot, dpos, ctx,
-                                                              m->rope_base, m->eps, d_delta, mtab_now, rs);
+            if (kv16)
+                k_attn_prep<__half><<<dim3(H + HKV, T), kThreads, 0, st>>>(
+                    qg, kx, vx, L.q_norm, L.k_norm, q, gate, rows_mode ? nullptr : reinterpret_cast<__half*>(kc[li]),
+                    rows_mode ? nullptr : reinterpret_cast<__half*>(vc[li]), H, HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps,
+                    d_delta, mtab_now, rs);
+            else
+                k_attn_prep<float><<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate,
+                                                                         rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li],
+                                                                         H, HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps,
+                                                                         d_delta, mtab_now, rs);
             if (T > kGemmT) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
@@ -2278,7 +2315,11 @@ struct Engine {
                 const int G = H / HKV;
                 const float one = 1.0f, zero = 0.0f;
                 prof_tick(-1);
-                k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
+                if (kv16)
+                    k_kv_f16<__half><<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(
+                        reinterpret_cast<const __half*>(kc[li]), reinterpret_cast<const __half*>(vc[li]), k16, v16, ctx, P, HD, HKV);
+                else
+                    k_kv_f16<float><<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
                 if (att_grouped) {
                     // the G query heads of a KV head as one product: columns (t, g) of q16 [kvh][t][g][HD], one GEMM per KV head
                     // (a batch of HKV) of N = nt * G columns instead of G narrow ones; each slice only over the cells its rows see
@@ -2361,9 +2402,7 @@ struct Engine {
                     const float* vcl = rows_mode ? nullptr : vc[li];
                     const float scale = 1.0f / sqrtf((float) HD);
                     const bool gqa = fast_k && attn_part_gqa(H / HKV, nc, nt, HKV, q, kcl, vcl, dpos, t0, H, ctx, scale, rs);
-                    if (!gqa)
-                        k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, kcl, vcl, dpos, t0, H, HKV, ctx, scale, n_chunk,
-                                                                             pacc, pm, pl, rs);
+                    if (!gqa) attn_part_old(dim3(nc, nt * H), q, kcl, vcl, dpos, t0, H, HKV, ctx, scale, rs);
                     k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att, rs);
                     if (gqa && verify_k) {   // the per-head kernel into scratch, compared bit for bit
                         const size_t need = (size_t) T * H * HD;
@@ -2372,8 +2411,7 @@ struct Engine {
                             CK(cudaMalloc((void**) &vatt, need * 4));
                             vatt_n = need;
                         }
-                        k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, kcl, vcl, dpos, t0, H, HKV, ctx, scale, n_chunk,
-                                                                             pacc, pm, pl, rs);
+                        attn_part_old(dim3(nc, nt * H), q, kcl, vcl, dpos, t0, H, HKV, ctx, scale, rs);
                         k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, vatt, rs);
                         const size_t off = (size_t) t0 * H * HD;
                         verify_cmp("attn_part_gqa", att + off, vatt + off, (size_t) nt * H * HD, " T " + std::to_string(T));
@@ -3042,7 +3080,7 @@ struct Engine {
         const Sess& a = sess[(size_t) src];
         Sess& b = sess[(size_t) dst];
         const size_t C = (size_t) g.ssm_conv_channels;
-        const size_t row = (size_t) ctx * g.head_dim * 4;
+        const size_t row = (size_t) ctx * g.head_dim * kv_elt();
         for (size_t l = 0; l < a.conv.size(); ++l) {
             if (a.conv[l]) {
                 CK(cudaMemcpyAsync(b.conv[l], a.conv[l], C * (g.ssm_d_conv - 1) * 4, cudaMemcpyDeviceToDevice, st));
@@ -3050,9 +3088,9 @@ struct Engine {
                                    cudaMemcpyDeviceToDevice, st));
             }
             if (a.kc[l] && a.pos > 0) {
-                CK(cudaMemcpy2DAsync(b.kc[l], row, a.kc[l], row, (size_t) a.pos * g.head_dim * 4, (size_t) g.n_head_kv,
+                CK(cudaMemcpy2DAsync(b.kc[l], row, a.kc[l], row, (size_t) a.pos * g.head_dim * kv_elt(), (size_t) g.n_head_kv,
                                      cudaMemcpyDeviceToDevice, st));
-                CK(cudaMemcpy2DAsync(b.vc[l], row, a.vc[l], row, (size_t) a.pos * g.head_dim * 4, (size_t) g.n_head_kv,
+                CK(cudaMemcpy2DAsync(b.vc[l], row, a.vc[l], row, (size_t) a.pos * g.head_dim * kv_elt(), (size_t) g.n_head_kv,
                                      cudaMemcpyDeviceToDevice, st));
             }
         }
