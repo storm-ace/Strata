@@ -139,6 +139,7 @@ Four changes aimed at agents: long prompts (30K+ tokens) and sampling at a tempe
 | MTP drafts for sampled requests | A request with a temperature (or penalties) now runs speculative steps too. A draft is kept with the probability p(draft) of the distribution the plain sampler draws from (temperature, top-k, top-p, min-p, penalties), else the token is drawn from that distribution without the draft (`sample_spec`). With a one-token draft this is the standard speculative-sampling rule, so the tokens have exactly the plain sampler's distribution. The verify window's logits come to the host per row (`Engine::Judge`). | Distribution-exact, not token-exact: the random stream is used differently than one token at a time. | `STRATA_Q36_NO_SPEC_SAMPLE=1` |
 | Flash prompt attention on the matrix cores (`k_attn_fa_wmma`) | On RDNA3 / RDNA3.5 (gfx110x, gfx115x) the grouped prompt attention runs as one fused kernel instead of scores GEMM, softmax and values GEMM: 64 grouped query rows per block (4 waves of 16 rows, each holding all 256 output dims), 16-cell K / V tiles in LDS (V transposed), `v_wmma_f32_16x16x16_f16` for Q K^T and P V, an online softmax in log2 space per row. No T x P score matrix is written. The kernel's comment documents the fragment layout. The device code reports whether it was built for the running GPU (`k_fa_supported`): on by default on gfx1151, where it was measured; on the other RDNA3 / RDNA3.5 chips it is compiled but runs only with `STRATA_Q36_FA=1` (not run on them); elsewhere the grouped GEMMs run. | FP16 operands, FP32 accumulation: not the GEMM path's bits. KL against the old path (no table, GEMMs, old attention) on the 1,229-token prompt: 2.2e-6 mean in 256-cell chunks, 1.2e-6 in one chunk, top-1 32 of 32. | `STRATA_Q36_NO_FA=1` |
 | hipBLASLt table rows for this model | The prompt projections (`prefill::Gemm::native`) found no row for Qwen3.6's shapes (hidden 2048: N x K = 8192 x 2048, 4096 x 2048, 2048 x 4096, 512 x 2048, 2048 x 512) in `tools/hip/gfx1151-hipblaslt-100500.txt` and every one fell back to hipBLAS (`STRATA_HIPBLASLT_VERBOSE=1`: `launches=0 fallbacks=1250`). 35 rows (T = 16 .. 4096) calibrated with `tune_hipblaslt` on the 8060S; the tuner measured up to 5.6x the hipBLAS time. | hipBLASLt's own check (relative L2 under 1e-4), and in the KL row above. | `STRATA_HIPBLASLT_TABLE=off` |
+| FP16 K / V cache (opt-in) | `STRATA_Q36_KV16=1` stores the attention layers' K / V caches (and the MTP block's) in FP16 instead of FP32: half the bytes the decode attention reads per token, and half the cache memory (about 22 KB per cell instead of 45 KB). `k_attn_prep`, `k_attn_part`, `k_attn_part_gqa` and the prompt attention's FP16 conversion take the element type as a template; the cache pointers stay `float*`. Off by default. | The values are rounded to FP16 once, when they are written. With it on, `STRATA_Q36_VERIFY=1` still finds the GQA and the per-head decode kernel equal (22,512 comparisons, 0 mismatches). KL against the FP32 cache on the 1,229-token prompt in 256-cell chunks: 1.9e-6 mean, 3.7e-5 max, top-1 32 of 32. | unset |
 | Prompt probe | `STRATA_Q36_PROF=1` times the prompt attention's parts (FP16 conversion, scores GEMM or the fused kernel, softmax, values GEMM) and the layers by type (GDN mixers, attention mixers, MoE blocks) on the host, with a stream sync at each tick; `--bench-pp` prints them. | Probe only: the syncs slow the prompt a little. | - |
 
 > **Measured on:** Ryzen AI MAX+ PRO 395 (Radeon 8060S, HIP gfx1151, Windows 11, ROCm 10.2.0a20260930), UD-Q4_K_XL,
@@ -173,6 +174,17 @@ Through the server, end to end (same PC; temperature 0.6, 300 new tokens; the mo
 | ~36K-token prompt: prompt read | 110 s (323 tok/s) | 41.4 s (871 tok/s) |
 | ~36K-token prompt: decode | 13.9 tok/s | 28.5 to 33.2 (180 of 240) |
 | ~36K-token prompt: whole request | 131.8 s | 52.0 s |
+
+`--bench-pp 65536 --bench-tg 64` (greedy, no MTP drafts), FP32 against FP16 K / V cache, three arms in this order, each a
+fresh engine start with 3 repetitions:
+
+| K / V cache | Decode after 64K tokens (rep 0 / 1 / 2) | Prompt read |
+| --- | --- | --- |
+| FP32 | 20.8 / 23.7 / 21.6 tok/s | 688 to 694 tok/s |
+| FP16 (`STRATA_Q36_KV16=1`) | 23.5 / 25.1 / 24.2 | 686 to 692 |
+| FP32 again | 20.6 / 20.9 / 21.1 | 683 to 712 |
+
+About +13% to +16% decode at 64K; the prompt read does not change (its attention already runs on FP16 copies).
 
 ## Limits
 
