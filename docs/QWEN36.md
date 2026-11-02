@@ -174,6 +174,30 @@ Through the server, end to end (same PC; temperature 0.6, 300 new tokens; the mo
 | ~36K-token prompt: decode | 13.9 tok/s | 28.5 to 33.2 (180 of 240) |
 | ~36K-token prompt: whole request | 131.8 s | 52.0 s |
 
+### Small cards (8 GB): the slot loan
+
+On an 8 GB card the hybrid mode can end up with no expert in VRAM at all. Its prompt path keeps two staging buffers of
+one layer's experts each (1.10 GiB for UD-Q4_K_XL), and after them and the 0.77 GiB reserve nothing is left for slots.
+Every expert of every decoded token then runs on the CPU.
+
+> **Measured on:** RTX 3070 8 GB (Windows 11, WDDM, about 1.8 GB taken by the desktop), Core i9-11900 (8 cores),
+> 32 GB RAM, UD-Q4_K_XL, engine 0.1.55, `--max-context 8192 --mtp 2 --bench-pp 512 --bench-tg 128`, 3 repetitions.
+
+| What the log says | pp512 | tg128 |
+| --- | ---: | ---: |
+| `0 of 256 per layer in VRAM`, `1.10 GiB staging`, the experts in pageable host memory | 172.5 to 178.1 tok/s | 30.2 to 34.4 tok/s |
+
+`STRATA_Q36_SLOT_LOAN=1` (opt-in) puts the staging pair over the slots' VRAM instead of beside it. The decode uses that
+memory as slots; a prompt chunk of more than 128 rows writes over them, and the next decode step copies the slots it
+wrote over back from host memory first (once per prompt, not per chunk). On the card above that should give about 14
+slots per layer instead of none, for the price of one copy of up to 1.1 GiB after each long prompt. Only for one
+conversation at a time (with `--batch` it stays off), and only when the staging pair fits. The log line ends with
+`over the slots, STRATA_Q36_SLOT_LOAN` when it is on. Not measured yet: no numbers until there are.
+
+The CUDA build of the GQA decode attention takes narrower K tiles from 8 query heads per KV head on (16 dims instead of
+32, 8 instead of 16 from 16 heads), because CUDA allows a block 48 KB of static shared memory and the HIP tiles take
+51 KB there. Each cell's sum keeps its order, so the bits are the same. HIP keeps its tiles.
+
 ## Limits
 
 - Eight slots at most (the window holds 8 rows). `--batch-mtp` shares those rows between slots and proposals.

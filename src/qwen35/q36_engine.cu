@@ -367,7 +367,14 @@ __global__ void __launch_bounds__(256) k_attn_part_gqa(const float* q, const flo
                                                        int t0, int H, int HKV, int ctx, float scale, int n_chunk,
                                                        float* pacc, float* pm, float* pl, RowSel rs) {
     constexpr int HD = 256;
-    constexpr int TI = G <= 8 ? 32 : 16;   // K dims per tile: the chunk's cells x TI staged in LDS, read coalesced
+    // K dims per tile: the chunk's cells x TI staged in LDS, read coalesced.  CUDA caps a block's static shared memory
+    // at 48 KB (AMD: 64 KB), so the CUDA build takes narrower tiles from G = 8 on; each cell's sum keeps its order (bits)
+#if defined(__HIPCC__)
+    constexpr int TI = G <= 8 ? 32 : 16;
+#else
+    constexpr int TI = G <= 4 ? 32 : G <= 8 ? 16 : 8;
+    static_assert(4 * (2 * G * HD + kThreads + kChunkCells * (TI + 1)) <= 48 * 1024, "k_attn_part_gqa: static shared memory");
+#endif
     __shared__ float qs[G][HD], sc[G][kChunkCells], sh[kThreads], kt[kChunkCells][TI + 1];
     const int c = blockIdx.y, tl = blockIdx.x / HKV, kvh = blockIdx.x % HKV;
     const int t = t0 + tl;
@@ -1539,6 +1546,12 @@ struct Engine {
     uint8_t* acts = nullptr;   // per token: its quantized activation (kNativeActBytes)
     cudaEvent_t ev_route = nullptr;
     uint8_t* stage[2] = {};
+    // STRATA_Q36_SLOT_LOAN=1 (a small card): the staging pair lies over the slots' VRAM instead of beside it, so the
+    // decode keeps slots the pair would have taken; a streamed forward writes over the slots in [loan_lo, loan_hi) and
+    // the next batch that reads slots copies them back from host memory first (loan_restore)
+    bool slot_loan = false;
+    bool loan_dirty = false;
+    uint8_t *loan_lo = nullptr, *loan_hi = nullptr;
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
     std::vector<int> stream_seq;   // the state indices a streamed forward visits, in order
@@ -2394,6 +2407,7 @@ struct Engine {
         // the hybrid rows path: a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch
         // (its prompt pass too: no staging buffers then)
         const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
+        if (hy_rows && loan_dirty) loan_restore();
         const bool mmq_rows = !hy_rows && T > kGemmT && use_mmq;
         if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, T, ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
             K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
@@ -2555,7 +2569,30 @@ struct Engine {
     void stream_begin(const std::vector<int>& seq) {
         stream_seq = seq;
         stream_pos = 0;
+        if (slot_loan) {   // the pair's first copies wait for every earlier reader of the slots they write over
+            CK(cudaEventRecord(ev_used[0], st));
+            CK(cudaEventRecord(ev_used[1], st));
+            loan_dirty = true;
+        }
         for (int i = 0; i < 2 && i < (int) seq.size(); ++i) stream_kick(i);
+    }
+    /// After a streamed forward with the slot loan: the slots the staging pair wrote over (and their tails) back from
+    /// host memory, on the engine's stream, before a batch reads them.
+    void loan_restore() {
+        loan_dirty = false;
+        for (size_t li = 0; li < hy.size(); ++li) {
+            const Layer& L = layer_at((int) li);
+            if (L.n_slots <= 0 || !L.hblobs) continue;
+            const Hy& H = hy[li];
+            for (int s = 0; s < L.n_slots; ++s) {
+                uint8_t* d = L.blobs + (size_t) s * L.stride;
+                if (d >= loan_hi || d + L.stride <= loan_lo) continue;
+                CK(cudaMemcpyAsync(d, L.hblobs + (size_t) H.exp_in_slot[(size_t) s] * L.stride, L.stride,
+                                   cudaMemcpyHostToDevice, st));
+            }
+            uint8_t* t = L.blobs + (size_t) L.n_slots * L.stride;
+            if (t < loan_hi && t + kMmqTail > loan_lo) CK(cudaMemsetAsync(t, 0, kMmqTail, st));
+        }
     }
     void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % 2, after its last reader
         const int b = i % 2;
@@ -2569,8 +2606,10 @@ struct Engine {
         const Hy& H = hy[(size_t) stream_seq[(size_t) i]];
         // fewer than half the experts resident (a 12 GB card): the one whole-layer copy is faster than many small ones
         // (RTX 3060, UD-Q4_K_XL at 37 of 256: pp2048 1970 whole vs 1540 in runs)
-        if (all || 2 * L.n_slots < ne) {
+        // (with the slot loan the slots are the pair's own memory: always the whole layer, and the tail zeroed again)
+        if (all || slot_loan || 2 * L.n_slots < ne) {
             CK(cudaMemcpyAsync(stage[b], L.hblobs, L.stride * (size_t) ne, cudaMemcpyHostToDevice, cst));
+            if (slot_loan) CK(cudaMemsetAsync(stage[b] + L.stride * (size_t) ne, 0, kMmqTail, cst));
         } else {
             for (int x = 0; x < ne;) {
                 const bool dev = H.slot_of[(size_t) x] >= 0;
@@ -3292,8 +3331,26 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
+    // STRATA_Q36_SLOT_LOAN=1: the slots and the staging pair in one arena of max(pair, slot budget) bytes (one
+    // conversation only: a batch's decode windows between prompt chunks would restore the slots every time)
+    const char* loan_env = std::getenv("STRATA_Q36_SLOT_LOAN");
+    E.slot_loan = staging > 0 && E.n_sess == 1 && !mtp_only && loan_env && std::string(loan_env) != "0";
+    const size_t tails = all.size() * kMmqTail;
+    size_t arena_bytes = 0;
+    if (E.slot_loan) {
+        size_t room = std::max(budget2, staging);
+        if (room + ((size_t) 256 << 20) > fr) room = fr > ((size_t) 512 << 20) ? fr - ((size_t) 512 << 20) : 0;
+        if (room < staging) {
+            E.slot_loan = false;
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_SLOT_LOAN: not even the staging pair fits (%zu MiB), the "
+                         "slots stay beside it\n", staging >> 20);
+        } else {
+            slot_bytes = room > tails ? room - tails : 0;
+        }
+    }
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
     int S = slots > 0 ? (int) std::min<int64_t>(ne, slots) : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot);
+    if (E.slot_loan) arena_bytes = std::max(staging, (size_t) S * per_slot + tails);
     if (mtp_only) {   // the main layers all, the MTP block what is left
         const size_t left = budget2 > total_main ? budget2 - total_main : 0;
         S = (int) std::min<size_t>((size_t) ne, left / m.mtp.stride);
@@ -3301,8 +3358,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     {   // what the hybrid mode allocates next (the staging pair, the CPU part's outputs, the slots) against the VRAM the
         // sessions and the context left: said with the numbers instead of a cudaMalloc failure (8 slots on a 12 GB card)
         const size_t Tn = (size_t) E.tmax, Nn = (size_t) g.n_embd, Kn = (size_t) m.top_k;
-        size_t need = staging + Tn * Kn * Nn * 4 + Tn * Kn * 4;
+        size_t need = (E.slot_loan ? arena_bytes : staging) + Tn * Kn * Nn * 4 + Tn * Kn * 4;
         for (Layer* L : all) {
+            if (E.slot_loan) break;   // the slots are in the arena
             if (mtp_only && L != &m.mtp) need += L->stride * (size_t) ne + kMmqTail;
             else need += (S > 0 ? (size_t) S * L->stride + kMmqTail : 0);
         }
@@ -3329,6 +3387,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
     }
     size_t off = 0;
+    uint8_t* loan_arena = nullptr;
+    size_t loan_off = 0;
+    if (E.slot_loan) {
+        CK(cudaMalloc(&loan_arena, arena_bytes));
+        CK(cudaMemset(loan_arena, 0, arena_bytes));
+    }
     E.hy.resize(all.size());
     for (size_t li = 0; li < all.size(); ++li) {
         Layer& L = *all[li];
@@ -3348,7 +3412,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
         for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
         L.n_slots = S;
-        if (S > 0) {
+        if (S > 0 && E.slot_loan) {
+            L.blobs = loan_arena + loan_off;   // zeroed with the arena
+            loan_off += L.stride * (size_t) S + kMmqTail;
+            CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) S, cudaMemcpyHostToDevice));
+        } else if (S > 0) {
             CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) S + kMmqTail));
             CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) S, cudaMemcpyHostToDevice));
@@ -3381,9 +3449,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
     if (staging) {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
+        if (E.slot_loan) {
+            E.loan_lo = loan_arena;
+            E.loan_hi = loan_arena + staging;
+        }
         for (int b = 0; b < 2; ++b) {
-            CK(cudaMalloc(&E.stage[b], max_layer + kMmqTail));
-            CK(cudaMemset(E.stage[b], 0, max_layer + kMmqTail));
+            if (E.slot_loan) {
+                E.stage[b] = loan_arena + (size_t) b * (max_layer + kMmqTail);
+            } else {
+                CK(cudaMalloc(&E.stage[b], max_layer + kMmqTail));
+                CK(cudaMemset(E.stage[b], 0, max_layer + kMmqTail));
+            }
             CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
             CK(cudaEventRecord(E.ev_used[b], E.st));
@@ -3398,9 +3474,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     else
     std::fprintf(stderr, "strata-q36: hybrid experts: %d of %lld per layer in VRAM (%.2f GiB), all %.2f GiB in %s host "
                  "memory, the rest of a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f GiB "
-                 "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
+                 "staging%s); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
                  pinned ? "pinned" : "pageable", E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
-                 (double) staging / (1 << 30), ms_since(t0) / 1000.0);
+                 (double) staging / (1 << 30), E.slot_loan ? " over the slots, STRATA_Q36_SLOT_LOAN" : "",
+                 ms_since(t0) / 1000.0);
     return true;
 #endif
 }
