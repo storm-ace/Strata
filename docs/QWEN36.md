@@ -189,14 +189,46 @@ Every expert of every decoded token then runs on the CPU.
 
 `STRATA_Q36_SLOT_LOAN=1` (opt-in) puts the staging pair over the slots' VRAM instead of beside it. The decode uses that
 memory as slots; a prompt chunk of more than 128 rows writes over them, and the next decode step copies the slots it
-wrote over back from host memory first (once per prompt, not per chunk). On the card above that should give about 14
-slots per layer instead of none, for the price of one copy of up to 1.1 GiB after each long prompt. Only for one
-conversation at a time (with `--batch` it stays off), and only when the staging pair fits. The log line ends with
-`over the slots, STRATA_Q36_SLOT_LOAN` when it is on. Not measured yet: no numbers until there are.
+wrote over back from host memory first (once per prompt, not per chunk). Only for one conversation at a time (with
+`--batch` it stays off). The log line ends with `over the slots, STRATA_Q36_SLOT_LOAN` when it is on.
+
+> **Measured on:** the same PC, this branch built with CUDA 13.4 for sm_86 (Visual Studio 2026, Ninja, the flags of
+> `setup.py`), engine 0.1.55 as the ready-made release. The free VRAM moved between 1.2 and 2.6 GiB with what the
+> desktop held, so the slot counts differ between the tables.
+
+Benchmark, `--max-context 8192 --mtp 2 --bench-pp 512 --bench-tg 128` (greedy), 3 interleaved rounds of 3 repetitions,
+medians of 9:
+
+| Engine | Slots per layer | Entries on the GPU | pp512 | tg128 |
+| --- | ---: | ---: | ---: | ---: |
+| 0.1.55 | 10 | 9.7% | 234.8 tok/s | 34.5 tok/s |
+| this branch | 9 | 14.8% | 228.9 | 35.7 |
+| this branch, `STRATA_Q36_SLOT_LOAN=1` | 24 | 29.2% | 244.2 | 39.4 (+10.4%, 3 of 3 rounds) |
+
+Through the server (Strata Control 0.1.54's `serve/server.py`), the run config's own `--max-context 20480 --prefill auto
+--mtp 2`, salted slices of `q36_engine.cu` as prompts, nothing reused, `max_tokens` 300 at temperature 0.6 / top_p 0.95.
+One fresh server per row; decode tok/s from the engine's `session 0` lines:
+
+| Engine | Slots per layer | ~2.5K-token prompt | ~10K-token prompt | Drafts kept |
+| --- | ---: | ---: | ---: | --- |
+| 0.1.55 | 0 | 32.6, 32.7 | 26.0, 26.0 | none (a sampled request had no drafts) |
+| this branch | 0 | 41.9, 38.6, 40.5, 39.1 | 40.7, 40.4, 41.0, 40.3 | 159-172 of 254-280 |
+| this branch, `STRATA_Q36_SLOT_LOAN=1` | 15 | 45.8, 47.0 | 47.2, 44.7 | 169-174 of 252-260 |
+
+The prompt read stayed at 211-249 tok/s in every row: the copy back after the prompt did not show. At 32K context the
+engine does not start on this card (the staging pair needs 1,159 MiB and 698 MiB were free), with or without the loan.
+
+Exactness, `STRATA_Q36_FIXED_SLOTS=1 --expert-slots 9`, a 1,444-token prompt (`tools/qwen35/parity_prompts.ids` five
+times), 64 greedy tokens: the tokens with and without the loan are the same, with `--mtp 0` and with `--mtp 2`. The
+loan changes which experts the decode finds in VRAM, and the GPU and the CPU round differently, so with the slots left
+to adapt the text can differ, as with any other slot count.
 
 The CUDA build of the GQA decode attention takes narrower K tiles from 8 query heads per KV head on (16 dims instead of
 32, 8 instead of 16 from 16 heads), because CUDA allows a block 48 KB of static shared memory and the HIP tiles take
-51 KB there. Each cell's sum keeps its order, so the bits are the same. HIP keeps its tiles.
+51 KB there. Each cell's sum keeps its order, so the bits are the same. HIP keeps its tiles. Checked on the RTX 3070:
+the full logits of 32 greedy decode steps after the 1,444-token prompt (`--dump-full-logits`, `--mtp 0 --no-graph`,
+fixed slots) are equal byte for byte with and without `STRATA_Q36_OLD_KERNELS=1`. `STRATA_Q36_VERIFY=1` stops in the
+hybrid mode (`cudaMemcpy ... invalid argument` in `verify_cmp`), so it was not used.
 
 ## Limits
 

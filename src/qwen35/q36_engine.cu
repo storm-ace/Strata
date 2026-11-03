@@ -3338,15 +3338,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     const size_t tails = all.size() * kMmqTail;
     size_t arena_bytes = 0;
     if (E.slot_loan) {
-        size_t room = std::max(budget2, staging);
+        // the slot budget, held to the room the slots beside the pair could have had (fr less 512 MiB), but never
+        // below the pair itself: that much the plain path allocates anyway (the check below still guards fr)
+        size_t room = budget2;
         if (room + ((size_t) 256 << 20) > fr) room = fr > ((size_t) 512 << 20) ? fr - ((size_t) 512 << 20) : 0;
-        if (room < staging) {
-            E.slot_loan = false;
-            std::fprintf(stderr, "strata-q36: STRATA_Q36_SLOT_LOAN: not even the staging pair fits (%zu MiB), the "
-                         "slots stay beside it\n", staging >> 20);
-        } else {
-            slot_bytes = room > tails ? room - tails : 0;
-        }
+        room = std::max(room, staging);
+        slot_bytes = room > tails ? room - tails : 0;
     }
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
     int S = slots > 0 ? (int) std::min<int64_t>(ne, slots) : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot);
